@@ -1,6 +1,6 @@
 """Draw an N x N caro/Gomoku grid with Dobot Magician.
 
-N can be selected from 3 to 9.
+N can be selected from 3 to 15.
 The robot's CURRENT pose is treated as the TOP-LEFT OUTER CORNER
 of the grid and as the pen-down drawing height.
 
@@ -24,6 +24,7 @@ import time
 from typing import List, Tuple
 
 from lib import DobotDllType as dType
+from gomoku_ai import MAX_BOARD_SIZE, MIN_BOARD_SIZE
 
 # ============================================================
 # CONNECTION
@@ -38,8 +39,6 @@ DEFAULT_BOARD_SIZE = 3
 DEFAULT_CELL_SIZE_MM = 25.0
 DEFAULT_HOVER_HEIGHT_MM = 12.0
 
-MIN_BOARD_SIZE = 3
-MAX_BOARD_SIZE = 10
 MIN_CELL_SIZE_MM = 8.0
 MAX_CELL_SIZE_MM = 50.0
 MIN_HOVER_HEIGHT_MM = 5.0
@@ -389,7 +388,8 @@ def draw_grid(
 
 def main() -> None:
     print("=" * 72)
-    print("DOBOT CARO GRID DRAWER: 3x3 TO 9x9")
+    print(f"DOBOT CARO GRID DRAWER: {MIN_BOARD_SIZE}x{MIN_BOARD_SIZE} "
+          f"TO {MAX_BOARD_SIZE}x{MAX_BOARD_SIZE}")
     print("=" * 72)
     print("Place the pen at the TOP-LEFT OUTER CORNER of the grid.")
     print("The current Z must be the drawing height.")

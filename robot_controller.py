@@ -18,7 +18,7 @@ from lib import DobotDllType as dType
 # MOTION CONFIGURATION
 # ============================================================
 # PTP is used to move between cells and approach/lift the pen.
-PTP_XYZ_VELOCITY = 150.0
+PTP_XYZ_VELOCITY = 130.0
 PTP_XYZ_ACCELERATION = 120.0
 PTP_R_VELOCITY = 70.0
 PTP_R_ACCELERATION = 60.0
@@ -28,12 +28,12 @@ PTP_ACCELERATION_RATIO = 70.0
 # ARC/CIRCLE is used while drawing O.
 # Higher ratios and acceleration keep the pen moving across the arc junction.
 # Lower them if the pen overshoots or skips on the paper.
-ARC_XYZ_VELOCITY = 135.0
-ARC_XYZ_ACCELERATION = 140.0
+ARC_XYZ_VELOCITY = 120.0
+ARC_XYZ_ACCELERATION = 120.0
 ARC_R_VELOCITY = 65.0
 ARC_R_ACCELERATION = 90.0
-ARC_VELOCITY_RATIO = 95.0
-ARC_ACCELERATION_RATIO = 95.0
+ARC_VELOCITY_RATIO = 85.0
+ARC_ACCELERATION_RATIO = 85.0
 
 # Number of SetARCCmd calls used to draw the O mark.
 #   1 -> one 359-degree arc (no junction, leaves a 1-degree gap)

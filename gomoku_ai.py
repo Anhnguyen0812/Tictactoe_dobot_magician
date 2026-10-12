@@ -1,4 +1,4 @@
-"""Board rules and lightweight Gomoku AI for board sizes 3..9."""
+"""Board rules and lightweight Gomoku AI for board sizes 3..15."""
 from __future__ import annotations
 
 import random
@@ -9,12 +9,52 @@ from typing import Iterable, Optional
 EMPTY = " "
 DIRECTIONS = ((1, 0), (0, 1), (1, 1), (1, -1))
 
+MIN_BOARD_SIZE = 3
+MAX_BOARD_SIZE = 15
+BOARD_SIZES = tuple(range(MIN_BOARD_SIZE, MAX_BOARD_SIZE + 1))
+
+# Longest winning run the engine ever needs; wider windows are never scored.
+MAX_WIN_LENGTH = 5
+
 
 def win_length_for_size(size: int) -> int:
-    """3x3 uses 3-in-a-row; 4x4 uses 4; 5x5..9x9 use 5."""
-    if not 3 <= size <= 10:
-        raise ValueError("Board size must be between 3 and 10")
-    return min(5, size) if size <= 9 else 6
+    """3x3 uses 3-in-a-row; 4x4 uses 4; every larger board uses 5."""
+    if not MIN_BOARD_SIZE <= size <= MAX_BOARD_SIZE:
+        raise ValueError(
+            f"Board size must be between {MIN_BOARD_SIZE} and {MAX_BOARD_SIZE}"
+        )
+    return min(MAX_WIN_LENGTH, size)
+
+
+# Difficulty levels. HARD falls back to the per-size depth cap and time budget
+# below, which is the strongest configuration this engine reaches (~5 s per
+# move on 10x10).
+DIFFICULTY_EASY = "easy"
+DIFFICULTY_MEDIUM = "medium"
+DIFFICULTY_HARD = "hard"
+DIFFICULTIES = (DIFFICULTY_EASY, DIFFICULTY_MEDIUM, DIFFICULTY_HARD)
+
+
+@dataclass(frozen=True)
+class DifficultyProfile:
+    """Search effort of one difficulty level.
+
+    A depth or time_limit of None falls back to the per-size defaults
+    SEARCH_DEPTH_BY_SIZE and TIME_LIMIT_BY_SIZE.
+    """
+
+    depth: Optional[int]
+    time_limit: Optional[float]
+
+
+DIFFICULTY_PROFILES = {
+    # Two plies: one robot move plus the single best human reply.
+    DIFFICULTY_EASY: DifficultyProfile(depth=2, time_limit=0.5),
+    # Four plies: short forcing sequences are visible.
+    DIFFICULTY_MEDIUM: DifficultyProfile(depth=4, time_limit=2.0),
+    # Per-size defaults: 5 plies and ~5 s per move on the large boards.
+    DIFFICULTY_HARD: DifficultyProfile(depth=None, time_limit=None),
+}
 
 
 @dataclass
@@ -99,7 +139,8 @@ class GomokuAI:
     - incremental evaluation (only the lines through a placed stone are
       rescored), which makes leaf evaluation O(1);
     - Zobrist hashing plus a transposition table to reuse searched nodes;
-    - iterative deepening bounded by a per-move time budget.
+    - iterative deepening bounded by a per-move time budget;
+    - easy/medium/hard profiles that cap the search depth and the time budget.
     """
 
     WIN_SCORE = 100_000_000
@@ -112,8 +153,25 @@ class GomokuAI:
     WINDOW_SCORE = (0, 1, 20, 400, 8_000, WIN_SCORE, WIN_SCORE)
 
     # Iterative-deepening cap per board size; 3x3 searches the whole tree.
-    # The depth actually reached depends on `time_limit`.
-    SEARCH_DEPTH_BY_SIZE = {4: 7, 5: 5, 6: 4, 7: 4, 8: 5, 9: 5, 10: 4}
+    # The depth actually reached depends on the per-size time budget, so the
+    # cap is only a safety bound: raising it never costs quality, but a cap
+    # that is too low stops the search while budget is still left.
+    SEARCH_DEPTH_BY_SIZE = {
+        4: 7,
+        5: 6, 6: 6, 7: 6, 8: 6, 9: 6,
+        10: 6, 11: 6, 12: 6, 13: 6, 14: 6, 15: 6,
+    }
+
+    # Per-move thinking budget in seconds. A wider board costs more per node,
+    # so boards from LARGE_BOARD_SIZE up need a larger budget to reach the
+    # depth the smaller boards reach within DEFAULT_TIME_LIMIT.
+    LARGE_BOARD_SIZE = 10
+    LARGE_BOARD_TIME_LIMIT = 5.0
+    DEFAULT_TIME_LIMIT = 1.5
+
+    # The deadline is sampled every N nodes. A node costs ~2 ms, so sampling
+    # every 1024 nodes let a move run up to ~2 s past its budget.
+    DEADLINE_CHECK_INTERVAL_NODES = 64
 
     # Transposition-table bound flags.
     EXACT, LOWER, UPPER = 0, 1, 2
@@ -122,13 +180,28 @@ class GomokuAI:
         self,
         robot: str = "O",
         human: str = "X",
+        difficulty: str = DIFFICULTY_HARD,
         max_depth: Optional[int] = None,
-        time_limit: float = 1.5,
+        time_limit: Optional[float] = None,
     ) -> None:
+        profile = DIFFICULTY_PROFILES.get(difficulty)
+        if profile is None:
+            raise ValueError(
+                f"Unknown difficulty {difficulty!r}; "
+                f"expected one of {', '.join(DIFFICULTIES)}"
+            )
+
         self.robot = robot
         self.human = human
-        self.max_depth = max_depth
-        self.time_limit = time_limit
+        self.difficulty = difficulty
+        # An explicit argument wins, then the difficulty profile, then the
+        # per-size defaults resolved in _max_depth/_time_limit.
+        self.max_depth = (
+            max_depth if max_depth is not None else profile.depth
+        )
+        self.time_limit = (
+            time_limit if time_limit is not None else profile.time_limit
+        )
         self.last_depth: Optional[int] = None
 
         # Zobrist keys and line structures, rebuilt when the size changes.
@@ -198,7 +271,7 @@ class GomokuAI:
         if len(self._transposition) > 300_000:
             self._transposition.clear()
 
-        self._deadline = time.monotonic() + self.time_limit
+        self._deadline = time.monotonic() + self._time_limit(game)
         self.last_depth = 0
         best_move = candidates[0]
 
@@ -213,6 +286,17 @@ class GomokuAI:
                 break
 
         return best_move
+
+    def _time_limit(self, game: GomokuGame) -> float:
+        """Return the per-move thinking budget for this board size."""
+
+        if self.time_limit is not None:
+            return self.time_limit
+
+        if game.size >= self.LARGE_BOARD_SIZE:
+            return self.LARGE_BOARD_TIME_LIMIT
+
+        return self.DEFAULT_TIME_LIMIT
 
     def _root_search(
         self,
@@ -268,7 +352,10 @@ class GomokuAI:
         """Alpha-beta minimax over the incremental evaluation state."""
 
         self._nodes += 1
-        if (self._nodes & 1023) == 0 and time.monotonic() >= self._deadline:
+        if (
+            (self._nodes % self.DEADLINE_CHECK_INTERVAL_NODES) == 0
+            and time.monotonic() >= self._deadline
+        ):
             self._timed_out = True
 
         if self._timed_out:
@@ -623,11 +710,9 @@ class GomokuAI:
         if not game.is_empty(row, col):
             return False
 
-        self._set(row, col, symbol)
-        won = self._is_winning_position(game, move, symbol)
-        self._clear(row, col, symbol)
-
-        return won
+        # The cell itself is not read: _is_winning_position already counts the
+        # candidate stone, so mutating the board here would only cost time.
+        return self._is_winning_position(game, move, symbol)
 
     def _is_winning_position(
         self,
@@ -665,7 +750,8 @@ class GomokuAI:
         return False
 
     @staticmethod
-    def _count(      game: GomokuGame,
+    def _count(
+        game: GomokuGame,
         row: int,
         col: int,
         dr: int,

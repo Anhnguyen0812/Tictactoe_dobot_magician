@@ -1,4 +1,9 @@
-"""Variable-size 3x3..9x9 robot Gomoku game."""
+"""Variable-size 3x3..15x15 robot Gomoku game.
+
+Supports easy/medium/hard levels and a choice of who moves first. A failed
+drawing operation does not end the game: the player can reposition the arm and
+retry, or reconnect the robot and retry.
+"""
 from __future__ import annotations
 
 import time
@@ -7,8 +12,24 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from gomoku_ai import GomokuAI, GomokuGame
+from gomoku_ai import (
+    BOARD_SIZES,
+    DIFFICULTIES,
+    DIFFICULTY_HARD,
+    MAX_BOARD_SIZE,
+    MIN_BOARD_SIZE,
+    GomokuAI,
+    GomokuGame,
+)
 from robot_controller import DobotController
+
+# Players the human can put first at the start of a game.
+FIRST_PLAYERS = ("human", "robot")
+
+# Answers accepted by the recovery prompt shown after a failed drawing.
+RETRY_DRAW = "1"
+RECONNECT_ROBOT = "2"
+STOP_GAME = "3"
 
 DOBOT_PORT = "COM40"
 CAMERA_INDEX = 0
@@ -20,6 +41,11 @@ CIRCLE_RADIUS_RATIO = 0.27
 WIN_LINE_EXTENSION_RATIO = 0.4
 DETECT_INTERVAL = 0.15
 CONFIRM_SECONDS = 0.45
+
+# Errors the robot raises when a motion cannot be completed: alarms, timeouts
+# and rejected parameters (a zero circle radius caused by bad calibration).
+# Any other exception is a bug in this script, not a robot fault.
+ROBOT_FAULT_ERRORS = (RuntimeError, TimeoutError, ValueError)
 
 # Right-hand overlay panel that shows the played moves and timings.
 PANEL_WIDTH = 300
@@ -238,11 +264,23 @@ class BoardVision:
 
 
 class RobotGomoku:
-    def __init__(self, size: int):
+    def __init__(
+        self,
+        size: int,
+        difficulty: str = DIFFICULTY_HARD,
+        robot_first: bool = False,
+    ):
         self.game = GomokuGame(size)
-        self.ai = GomokuAI()
+        self.difficulty = difficulty
+        self.robot_first = robot_first
+        self.ai = GomokuAI(difficulty=difficulty)
         self.vision = BoardVision(size)
-        self.robot = DobotController(DOBOT_PORT)
+        try:
+            self.robot = DobotController(DOBOT_PORT)
+        except Exception:
+            # The camera is already open, so release it before failing.
+            self.vision.close()
+            raise
         self.robot_corners = []
         self.centers = []
         self.z_draw = Z_DRAW
@@ -273,10 +311,20 @@ class RobotGomoku:
                             top_y + v * (bottom_y - top_y)))
             self.centers.append(row)
 
+    def _recover_robot(self) -> None:
+        """Park the arm after a failed motion without masking the cause."""
+        try:
+            self.robot.recover()
+        except Exception as recovery_error:
+            print(f"Recovery failed: {recovery_error}")
+
     def draw_o(self, row: int, col: int) -> bool:
         cx, cy = self.centers[row][col]
-        # Save the robot pose before drawing.
-        pose_before = self.robot.pose()
+        start_pose = self.robot.pose()
+        # Park target: keep the original X/Y but stop at hover height, so the
+        # pen tip never touches the paper on the way back.
+        park_x, park_y = start_pose[0], start_pose[1]
+        r_head = start_pose[3]
 
         # Radius adapts to the physical spacing between neighboring centers.
         distances = []
@@ -287,25 +335,28 @@ class RobotGomoku:
             nx, ny = self.centers[row + 1][col]
             distances.append(((nx - cx) ** 2 + (ny - cy) ** 2) ** 0.5)
         radius = min(distances or [12.0]) * CIRCLE_RADIUS_RATIO
-        r_head = self.robot.pose()[3]
         start_x = cx + radius
         hover = self.z_draw + Z_HOVER
         try:
+            # Lift straight up first: one combined X/Y/Z move would drag the
+            # pen across the board when it starts at drawing height.
+            self.robot.move(park_x, park_y, hover, r_head)
             self.robot.move(start_x, cy, hover, r_head)
             self.robot.move(start_x, cy, self.z_draw, r_head)
             self.robot.circle_three_arcs(cx, cy, self.z_draw, radius, r_head)
             self.robot.move(start_x, cy, hover, r_head)
-            self.robot.move(cx, cy, hover, r_head)
-            # Restore the robot pose after drawing.
-            self.robot.move(*pose_before)
+            # Travel back to the original X/Y and stay at hover height.
+            self.robot.move(park_x, park_y, hover, r_head)
             return True
-        except Exception as error:
+        except ROBOT_FAULT_ERRORS as error:
             print(f"Draw failed: {error}")
-            try:
-                self.robot.recover()
-            except Exception as recovery_error:
-                print(f"Recovery failed: {recovery_error}")
+            self._recover_robot()
             return False
+        except Exception:
+            # A bug in this script must not be reported as a robot fault: park
+            # the arm, then let the traceback surface.
+            self._recover_robot()
+            raise
 
     def draw_winning_line(self, cells: list[tuple[int, int]]) -> bool:
         """Draw one straight line through the winning run of cells."""
@@ -336,49 +387,139 @@ class RobotGomoku:
             self.robot.move(end_x, end_y, self.z_draw, r_head)
             self.robot.move(end_x, end_y, hover, r_head)
             return True
-        except Exception as error:
+        except ROBOT_FAULT_ERRORS as error:
             print(f"Win line failed: {error}")
-            try:
-                self.robot.recover()
-            except Exception as recovery_error:
-                print(f"Recovery failed: {recovery_error}")
+            self._recover_robot()
             return False
+        except Exception:
+            # Keep script bugs visible instead of reporting a robot fault.
+            self._recover_robot()
+            raise
 
     def play(self):
         self.vision.calibrate()
         self.calibrate_robot()
+        print(f"Difficulty: {self.difficulty}")
+        print(f"First player: {'robot' if self.robot_first else 'human'}")
         input("Calibration finished. Press ENTER to start...")
         self.game.print_board()
+
+        robot_turn = self.robot_first
+        while not self.game.winner() and not self.game.full():
+            if robot_turn:
+                if not self.take_robot_turn():
+                    return
+            else:
+                outcome = self.take_human_turn()
+                if outcome is None:
+                    return
+                if not outcome:
+                    # The cell was already taken; ask again.
+                    continue
+            robot_turn = not robot_turn
+
+        self.finish_game()
+
+    def take_human_turn(self) -> Optional[bool]:
+        """Wait for one human move. None means the player quit."""
+        human_move = self.vision.wait_human(
+            self.game, self.history, self.last_think)
+        if human_move is None:
+            return None
+        if not self.game.place(*human_move, self.game.human):
+            return False
+        self.history.append(("human", human_move))
+        print(f"Human: {human_move}")
+        self.game.print_board()
+        return True
+
+    def take_robot_turn(self) -> bool:
+        """Think, draw the O and commit the move. False stops the game.
+
+        When the board is full there is nothing to draw; the caller's loop
+        condition then ends the game.
+        """
+        started = time.perf_counter()
+        move = self.ai.choose_move(self.game)
+        self.last_think = time.perf_counter() - started
+        if move is None:
+            return True
+
+        print(f"[AI] move={move} depth={self.ai.last_depth} "
+              f"think={self.last_think:.3f}s")
+        if not self.draw_with_retry(*move):
+            return False
+
+        self.game.place(*move, self.game.robot)
+        self.history.append(("robot", move))
+        print(f"Robot: {move}")
+        self.game.print_board()
+        return True
+
+    def draw_with_retry(self, row: int, col: int) -> bool:
+        """Draw the O, offering recovery after every failed attempt.
+
+        Returns False only when the player decides to stop the game.
+        """
         while True:
-            human_move = self.vision.wait_human(
-                self.game, self.history, self.last_think)
-            if human_move is None:
-                return
-            if not self.game.place(*human_move, self.game.human):
+            if self.draw_o(row, col):
+                return True
+            if not self.resolve_draw_failure():
+                return False
+
+    def resolve_draw_failure(self) -> bool:
+        """Ask how to recover from a failed drawing. False means stop.
+
+        draw_o has already cleared the fault, so the arm is idle and can be
+        moved by hand before a retry.
+        """
+        while True:
+            print("The robot could not finish drawing this O.")
+            print(f"  {RETRY_DRAW}: move the arm to a safe place, then retry")
+            print(f"  {RECONNECT_ROBOT}: reconnect the robot, then retry")
+            print(f"  {STOP_GAME}: stop the game")
+            answer = input(f"Choice [{RETRY_DRAW}]: ").strip() or RETRY_DRAW
+
+            if answer == RETRY_DRAW:
+                if not self.robot_is_ready():
+                    print("The robot is not connected; reconnect first.")
+                    continue
+                return True
+            if answer == RECONNECT_ROBOT:
+                if self.reconnect_robot():
+                    return True
                 continue
-            self.history.append(("human", human_move))
-            print(f"Human: {human_move}")
-            self.game.print_board()
-            if self.game.winner() or self.game.full():
-                break
+            if answer == STOP_GAME:
+                print("Stopping the game.")
+                return False
+            print(
+                f"Please enter {RETRY_DRAW}, {RECONNECT_ROBOT} "
+                f"or {STOP_GAME}."
+            )
 
-            started = time.perf_counter()
-            move = self.ai.choose_move(self.game)
-            self.last_think = time.perf_counter() - started
-            if move is None:
-                break
-            print(f"[AI] move={move} depth={self.ai.last_depth} "
-                  f"think={self.last_think:.3f}s")
-            if not self.draw_o(*move):
-                print("Game paused because the robot could not draw safely.")
-                return
-            self.game.place(*move, self.game.robot)
-            self.history.append(("robot", move))
-            print(f"Robot: {move}")
-            self.game.print_board()
-            if self.game.winner() or self.game.full():
-                break
+    def reconnect_robot(self) -> bool:
+        """Close the connection and open a fresh one. False on failure.
 
+        The board coordinates are absolute, so the calibrated centres stay
+        valid and the arm does not have to be re-taught.
+        """
+        try:
+            self.robot.close()
+        except Exception as error:
+            print(f"Closing the old connection failed: {error}")
+
+        try:
+            self.robot = DobotController(DOBOT_PORT)
+        except Exception as error:
+            print(f"Reconnect failed: {error}")
+            return False
+        return True
+
+    def robot_is_ready(self) -> bool:
+        """True when the current controller still has a live connection."""
+        return self.robot is not None and self.robot.connected
+
+    def finish_game(self):
         winner = self.game.winner()
         print(f"Winner: {winner}" if winner else "Draw")
         if winner == self.game.robot:
@@ -398,16 +539,48 @@ class RobotGomoku:
 def choose_size() -> int:
     while True:
         try:
-            size = int(input("Board size (3-10): ").strip())
-            if 3 <= size <= 10:
+            size = int(input(
+                f"Board size ({MIN_BOARD_SIZE}-{MAX_BOARD_SIZE}): "
+            ).strip())
+            if size in BOARD_SIZES:
                 return size
         except ValueError:
             pass
-        print("Please enter an integer from 3 to 10.")
+        print(
+            f"Please enter an integer from "
+            f"{MIN_BOARD_SIZE} to {MAX_BOARD_SIZE}."
+        )
+
+
+def choose_difficulty() -> str:
+    prompt = f"Difficulty ({', '.join(DIFFICULTIES)}) [{DIFFICULTY_HARD}]: "
+    while True:
+        answer = input(prompt).strip().lower()
+        if not answer:
+            return DIFFICULTY_HARD
+        if answer in DIFFICULTIES:
+            return answer
+        print(f"Please enter one of: {', '.join(DIFFICULTIES)}.")
+
+
+def choose_first_player() -> bool:
+    """Return True when the robot plays the first move."""
+    prompt = f"First player ({', '.join(FIRST_PLAYERS)}) [human]: "
+    while True:
+        answer = input(prompt).strip().lower()
+        if not answer:
+            return False
+        if answer in FIRST_PLAYERS:
+            return answer == "robot"
+        print(f"Please enter one of: {', '.join(FIRST_PLAYERS)}.")
 
 
 def main():
-    app = RobotGomoku(choose_size())
+    app = RobotGomoku(
+        choose_size(),
+        choose_difficulty(),
+        choose_first_player(),
+    )
     try:
         app.play()
     finally:

@@ -6,8 +6,12 @@ Each board square is one cell, matching the robot layout (the pen draws
 inside a cell, not on an intersection). Cell (row, col) maps directly to
 GomokuGame.board[row][col].
 
-The board size selector uses the same depth strategy as gomoku_ai
-(3x3 full search, 4x4 depth 7, 5x5 depth 5, 6x6/7x7 depth 4, 8x8/9x9 depth 3).
+The board size selector reuses the gomoku_ai strategy: every size takes its
+own iterative-deepening cap from SEARCH_DEPTH_BY_SIZE and its own thinking
+budget (LARGE_BOARD_TIME_LIMIT for boards of at least LARGE_BOARD_SIZE, so
+10x10 and wider automatically get more time than the smaller boards). The
+difficulty selector picks an easy/medium/hard profile from
+DIFFICULTY_PROFILES; hard uses those per-size defaults.
 """
 from __future__ import annotations
 
@@ -15,7 +19,14 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-from gomoku_ai import EMPTY, GomokuAI, GomokuGame
+from gomoku_ai import (
+    BOARD_SIZES,
+    DIFFICULTIES,
+    DIFFICULTY_HARD,
+    EMPTY,
+    GomokuAI,
+    GomokuGame,
+)
 
 CANVAS_SIZE = 560
 MARGIN = 30
@@ -36,7 +47,8 @@ class GomokuApp:
         self.root = root
         self.root.title("Gomoku AI Test")
         self.game: GomokuGame | None = None
-        self.ai = GomokuAI()
+        self.difficulty = DIFFICULTY_HARD
+        self.ai = GomokuAI(difficulty=self.difficulty)
         self.history: list[tuple[str, tuple[int, int]]] = []
         self.last_move: tuple[int, int] | None = None
         self.busy = False
@@ -53,10 +65,17 @@ class GomokuApp:
 
         ttk.Label(toolbar, text="Board:").pack(side=tk.LEFT)
         self.size_box = ttk.Combobox(
-            toolbar, width=3, state="readonly", values=(3, 4, 5, 6, 7, 8, 9, 10)
+            toolbar, width=3, state="readonly", values=BOARD_SIZES
         )
         self.size_box.set(5)
         self.size_box.pack(side=tk.LEFT, padx=(4, 12))
+
+        ttk.Label(toolbar, text="Difficulty:").pack(side=tk.LEFT)
+        self.difficulty_box = ttk.Combobox(
+            toolbar, width=7, state="readonly", values=DIFFICULTIES
+        )
+        self.difficulty_box.set(DIFFICULTY_HARD)
+        self.difficulty_box.pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(toolbar, text="First move:").pack(side=tk.LEFT)
         self.first_box = ttk.Combobox(
@@ -102,7 +121,9 @@ class GomokuApp:
     # ========================================================
     def new_game(self) -> None:
         size = int(self.size_box.get())
+        self.difficulty = self.difficulty_box.get()
         self.game = GomokuGame(size)
+        self.ai = GomokuAI(difficulty=self.difficulty)
         self.history.clear()
         self.last_move = None
         self.busy = False
@@ -110,7 +131,8 @@ class GomokuApp:
         self.draw()
         self.write_log("-" * 30)
         self.write_log(
-            f"New game {size}x{size} (win={self.game.win_length})"
+            f"New game {size}x{size} (win={self.game.win_length}, "
+            f"level={self.difficulty})"
         )
         if self.first_box.get() == "robot":
             self.set_status("Robot moves first...")
